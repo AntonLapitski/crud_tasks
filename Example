@@ -1,0 +1,1403 @@
+<?php
+
+namespace Anton\ValidationTask\Controllers;
+
+use Anton\ValidationTask\Core\Configurator;
+use Anton\ValidationTask\Helpers\DbConnector;
+use Anton\ValidationTask\Helpers\Logger;
+use Anton\ValidationTask\Helpers\CommonHelper;
+use Anton\ValidationTask\Models\User;
+use Anton\ValidationTask\Models\Roles;
+use Anton\ValidationTask\Models\Login;
+use Couchbase\ValueRecorder;
+use http\Params;
+use HttpHelpers\Request;
+use HttpHelpers\Response;
+use CMS\CMSValidator;
+use CMS\CMSValidatorException;
+use CMS\JWT\JWT;
+use CMS\JWT\Key;
+use CMSCrypter\Symmetric\Crypto as Symmetric;
+use CMSCryptoHiddenString\HiddenString;
+use CMSCrypter\KeyFactory;
+
+class FilesController extends \CMSRouter\Http\Controller
+{
+    const CONTENT_TYPE = 'content-type';
+
+    const CONTENT_TYPE_VALUE = 'application/json';
+
+    public $logger;
+
+    public $connection;
+
+    public $config;
+
+    public $userModel;
+
+    public  $cryptoEncrypter;
+    public function __construct(User $userModel)
+    {
+        $this->config = Configurator::getJWTConfig();
+        $instance = DbConnector::getInstance();
+        $this->connection = $instance->getConnection();
+        $this->userModel = $userModel;
+        $this->logger = new Logger();
+        $this->cryptoEncrypter = KeyFactory::loadEncryptionKey(__DIR__ . '/../../encryption.key');
+    }
+
+
+    public function buildCategoryTree(array &$elements, $parentId = null)
+    {
+        $branch = array();
+
+        foreach ($elements as $element) {
+            if ((string)$element['parent_id'] === (string)$parentId) {
+                $children = $this->buildCategoryTree($elements, $element['id']);
+                if ($children) {
+                    $element['children'] = $children;
+                }
+                $branch[] = $element;
+                unset($element);
+            }
+        }
+
+        return $branch;
+    }
+
+
+    function group_by_city($data, $field) {
+        $grouped_data = [];
+
+        foreach ($data as $item) {
+            $key = $item[$field];
+
+            if (!isset($grouped_data[$key])) {
+                $grouped_data[$key] = [];
+            }
+
+            $grouped_data[$key][] = $item;
+        }
+
+        return $grouped_data;
+    }
+
+    public function groupRecursive(array &$data, int $parentId = null): array {
+        $grouped = [];
+        foreach ($data as $item) {
+            if ($item['parent_id'] == $parentId) {
+                $new_item = $item;
+                $children = $this->groupRecursive($data, $item['category_id']);
+                if (!empty($children)) {
+                    $new_item['children'] = $children;
+                }
+                $grouped[] = $new_item;
+            }
+        }
+        return $grouped;
+    }
+
+    public function getParentsRecursive(array &$data, int $categoryId): array {
+        $grouped = [];
+        $i = 0;
+        foreach ($data as $item ) {
+            $i++;
+            if($item['category_id'] == $categoryId  && $item['parent_id'] != null) {
+                $grouped['parent_id'] = $item['parent_id'];
+                $grouped['url'] = $item['url'];
+                $par =  $this->getParentsRecursive($data, $item['parent_id']);
+                if (!empty($par)){
+                    $grouped[$i]['parent_id'] = $par;
+                }
+            }
+        }
+        return $grouped;
+    }
+
+    public function getAllFiles(Request $request, Response $response)
+    {
+        $data = $request->getPayload();
+        $type = $data->get('type');
+        $token = CommonHelper::parseToken($data->get('value'));
+        $ip = $_SERVER['REMOTE_ADDR'];
+        $time = date("Y-m-d H:i:s");
+        try {
+            $keyObj = new Key($this->config['key_access']['key'], 'HS256');
+            $decoded = JWT::decode($token, $keyObj);
+        } catch (\Exception $e){
+
+            if($e->getMessage() == "Expired token"){
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['status' => 'CODE:3.000']));
+                return $response;
+            } else {
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['status' => 'CODE:3.000']));
+                return $response;
+            }
+        }
+
+        $newUserResult = $this->userModel->selectLoginUserRolesInfo($token);
+
+        $logUserId = $newUserResult['user_id'];
+        $moduleFilesAccess = $newUserResult['module_files'];
+        $userName  = Symmetric::decrypt($newUserResult["name"], $this->cryptoEncrypter)->getString();
+
+        if ($newUserResult["status"] == 0) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'CODE:3.002']));
+            $this->logger->failOnFilesAllUserInactive($userName, $ip, $time);
+            return $response;
+        }
+
+        if($moduleFilesAccess != 1) {
+            $response->setStatusCode(Response::HTTP_FORBIDDEN);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'CODE:3.004']));
+            $this->logger->failOnFilesAllUserForbidden($userName, $ip, $time);
+            return $response;
+        }
+
+
+        $stmt = $this->connection->prepare(
+            "SELECT myfiles.id as file_id, myfiles.file_type, myfiles.file_name, myfiles.parent_type, myfiles.file_size, myfiles.file_status, category_names.category_id, category_names.name, category_names.url, category_names.description, category_structure.category_id, category_structure.parent_id 
+                   FROM `category_structure` INNER JOIN category_names ON category_structure.category_id = category_names.category_id 
+                   LEFT JOIN files as myfiles ON myfiles.parent_id = category_names.category_id 
+                   WHERE category_structure.parent_id IS NOT NULL AND category_structure.parent_id != 1 AND category_structure.parent_id != 2"
+        );
+        $stmt->execute([]);
+        $result = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+        $initialArray = [];
+        foreach ($result as $category) {
+            $initialArray[] = [
+                'id' => $category['category_id'],
+                'name' => $category['name'],
+                'parent_id' => $category['parent_id'],
+                'file_name' => $category['file_name'],
+                'childs' => $category['childs']
+            ];
+        }
+
+        $grouped_by_city = $this->group_by_city($result, 'name');
+        $keys = array_keys($grouped_by_city);
+
+        $someResult = [];
+
+        for ($i = 0, $j =0; $i < count($keys); $i++) {
+
+            $arr = [];
+            for ($z = 0; $z < count($grouped_by_city[$keys[$i]]); $z++) {
+
+                if ($grouped_by_city[$keys[$i]][$z]['file_id'] == null) {
+                    $arr [] = [];
+                } else {
+                    $arr [] = [
+                        'file_id' => $grouped_by_city[$keys[$i]][$z]['file_id'],
+                        'file_name' => $grouped_by_city[$keys[$i]][$z]['file_name'] .'.'. $grouped_by_city[$keys[$i]][$z]['file_type'],
+                        'file_size' => $grouped_by_city[$keys[$i]][$z]['file_size'],
+                        'file_status' => $grouped_by_city[$keys[$i]][$z]['file_status']
+                    ];
+                }
+            }
+    
+            $someResult [] = [
+                'category_id' => $grouped_by_city[$keys[$i]][0]['category_id'],
+                'parent_id' => $grouped_by_city[$keys[$i]][0]['parent_id'],
+                'url' => str_replace('/', '', $grouped_by_city[$keys[$i]][0]['url']),
+                'name' => str_replace(' ', '_', $grouped_by_city[$keys[$i]][0]['name']),
+                'files' => $arr
+            ];
+        }
+
+        $groupedData = $this->groupRecursive($someResult, 3);
+
+        $stmt = $this->connection->prepare(
+            "SELECT myfiles.id as file_id, myfiles.file_type, myfiles.file_name, myfiles.parent_type, myfiles.file_size, myfiles.file_status FROM `files` AS myfiles WHERE myfiles.parent_id = 3"
+        );
+        $stmt->execute([]);
+        $result = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+
+        $rootFiles = [];
+        foreach ($result as $rootFilesArr) {
+            $rootFiles[] = [
+                'file_id' => $rootFilesArr['file_id'],
+                'file_name' => $rootFilesArr['file_name'] . '.' . $rootFilesArr['file_type'],
+                'file_size' => $rootFilesArr['file_size'],
+                'file_status' => $rootFilesArr['file_status']
+            ];
+        }
+        $groupedData['root_files'] = $rootFiles;
+
+        $stmt = $this->connection->prepare(
+            "SELECT myfiles.id as file_id, myfiles.file_type, myfiles.file_name, myfiles.parent_type, myfiles.file_size, myfiles.file_status, category_names.category_id, category_names.name, category_names.url, category_names.description, category_structure.category_id, category_structure.parent_id FROM `category_structure` INNER JOIN category_names ON category_structure.category_id = category_names.category_id LEFT JOIN files as myfiles ON myfiles.parent_id = category_names.category_id WHERE category_structure.parent_id IS NOT NULL AND category_structure.parent_id != 1 AND category_structure.parent_id != 3"
+        );
+        $stmt->execute([]);
+        $result = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        $initialArray = [];
+
+        foreach ($result as $category) {
+            $initialArray[] = [
+                'id' => $category['category_id'],
+                'name' => $category['name'],
+                'parent_id' => $category['parent_id'],
+                'file_name' => $category['file_name'],
+                'childs' => $category['childs']
+            ];
+        }
+
+        $grouped_by_city = $this->group_by_city($result, 'name');
+        $keys = array_keys($grouped_by_city);
+
+        $someResult = [];
+
+        for ($i = 0, $j =0; $i < count($keys); $i++) {
+
+            $arr = [];
+            for ($z = 0; $z < count($grouped_by_city[$keys[$i]]); $z++) {
+
+                if ($grouped_by_city[$keys[$i]][$z]['file_id'] == null) {
+                    $arr [] = [];
+                } else {
+                    $arr [] = [
+                        'file_id' => $grouped_by_city[$keys[$i]][$z]['file_id'],
+                        'file_name' => $grouped_by_city[$keys[$i]][$z]['file_name'] .'.'. $grouped_by_city[$keys[$i]][$z]['file_type'],
+                        'file_size' => $grouped_by_city[$keys[$i]][$z]['file_size'],
+                        'file_status' => $grouped_by_city[$keys[$i]][$z]['file_status']
+                    ];
+                }
+            }
+            $someResult [] = [
+                'category_id' => $grouped_by_city[$keys[$i]][0]['category_id'],
+                'parent_id' => $grouped_by_city[$keys[$i]][0]['parent_id'],
+                'url' => str_replace('/', '', $grouped_by_city[$keys[$i]][0]['url']),
+                'name' => str_replace(' ', '_', $grouped_by_city[$keys[$i]][0]['name']),
+                'files' => $arr
+            ];
+        }
+
+        $groupedDataMedia = $this->groupRecursive($someResult, 2);
+
+        $stmt = $this->connection->prepare(
+            "SELECT myfiles.id as file_id, myfiles.file_type, myfiles.file_name, myfiles.parent_type, myfiles.file_size, myfiles.file_status FROM `files` AS myfiles WHERE myfiles.parent_id = 2"
+        );
+        $stmt->execute([]);
+        $result = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        $rootFiles = [];
+        foreach ($result as $rootFilesArr) {
+            $rootFiles[] = [
+                'file_id' => $rootFilesArr['file_id'],
+                'file_name' => $rootFilesArr['file_name'] . '.' . $rootFilesArr['file_type'],
+                'file_size' => $rootFilesArr['file_size'],
+                'file_status' => $rootFilesArr['file_status']
+            ];
+        }
+        $groupedDataMedia['root_files'] = $rootFiles;
+
+        $helper = new CommonHelper();
+        $helper->writeFileIntegrityInfo();
+
+        $response->setStatusCode(Response::HTTP_OK);
+        $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+        $response->setContent(json_encode(['status' => 'CODE:3.001', 'media' => $groupedDataMedia, 'files' => $groupedData], JSON_UNESCAPED_UNICODE ));
+        $this->logger->getFilesAll($userName, $ip, $time);
+        return $response;
+    }
+
+    public function getDownloadsFiles(Request $request, Response $response)
+    {
+        $data = $request->getPayload();
+        $type = $data->get('type');
+        $token = CommonHelper::parseToken($data->get('value'));
+        $ip = $_SERVER['REMOTE_ADDR'];
+        $time = date("Y-m-d H:i:s");
+
+        try {
+            $keyObj = new Key($this->config['key_access']['key'], 'HS256');
+            $decoded = JWT::decode($token, $keyObj);
+        } catch (\Exception $e){
+
+            if($e->getMessage() == "Expired token"){
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['status' => 'CODE:3.000']));
+                return $response;
+            } else {
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['status' => 'CODE:3.000']));
+                return $response;
+            }
+        }
+
+        $newUserResult = $this->userModel->selectLoginUserRolesInfo($token);
+
+        $logUserId = $newUserResult['user_id'];
+        $moduleFilesAccess = $newUserResult['module_files'];
+        $userName  = Symmetric::decrypt($newUserResult["name"], $this->cryptoEncrypter)->getString();
+
+        if ($newUserResult["status"] == 0) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'CODE:3.002']));
+            $this->logger->failOnFilesDownloadUserInactive($userName, $ip, $time);
+            return $response;
+        }
+
+        if($moduleFilesAccess != 1) {
+            $response->setStatusCode(Response::HTTP_FORBIDDEN);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'CODE:3.004']));
+            $this->logger->failOnFilesDownloadUserForbidden($userName, $ip, $time);
+            return $response;
+        }
+
+        $stmt = $this->connection->prepare(
+            "SELECT myfiles.id as file_id, myfiles.file_type, myfiles.file_name, myfiles.parent_type, myfiles.file_size, myfiles.file_status, category_names.category_id, category_names.name, category_names.url, category_names.description, category_structure.category_id, category_structure.parent_id FROM `category_structure` INNER JOIN category_names ON category_structure.category_id = category_names.category_id LEFT JOIN files as myfiles ON myfiles.parent_id = category_names.category_id WHERE category_structure.parent_id IS NOT NULL AND category_structure.parent_id != 1 AND category_structure.parent_id != 2"
+        );
+        $stmt->execute([]);
+        $result = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        $initialArray = [];
+        foreach ($result as $category) {
+            $initialArray[] = [
+                'id' => $category['category_id'],
+                'name' => $category['name'],
+                'parent_id' => $category['parent_id'],
+                'file_name' => $category['file_name'],
+                'childs' => $category['childs']
+            ];
+        }
+
+        $grouped_by_city = $this->group_by_city($result, 'name');
+        $keys = array_keys($grouped_by_city);
+
+        $someResult = [];
+
+        for ($i = 0, $j =0; $i < count($keys); $i++) {
+
+            $arr = [];
+            for ($z = 0; $z < count($grouped_by_city[$keys[$i]]); $z++) {
+
+                if ($grouped_by_city[$keys[$i]][$z]['file_id'] == null) {
+                    $arr [] = [];
+                } else {
+                    $arr [] = [
+                        'file_id' => $grouped_by_city[$keys[$i]][$z]['file_id'],
+                        'file_name' => $grouped_by_city[$keys[$i]][$z]['file_name'] .'.'. $grouped_by_city[$keys[$i]][$z]['file_type'],
+                        'file_size' => $grouped_by_city[$keys[$i]][$z]['file_size'],
+                        'file_status' => $grouped_by_city[$keys[$i]][$z]['file_status']
+                    ];
+                }
+            }
+    
+            $someResult [] = [
+                'category_id' => $grouped_by_city[$keys[$i]][0]['category_id'],
+                'parent_id' => $grouped_by_city[$keys[$i]][0]['parent_id'],
+                'url' => str_replace('/', '', $grouped_by_city[$keys[$i]][0]['url']),
+                'name' => str_replace(' ', '_', $grouped_by_city[$keys[$i]][0]['name']),
+                'files' => $arr
+            ];
+        }
+
+
+        $groupedData = $this->groupRecursive($someResult, 3);
+
+        $stmt = $this->connection->prepare(
+            "SELECT myfiles.id as file_id, myfiles.file_type, myfiles.file_name, myfiles.parent_type, myfiles.file_size, myfiles.file_status FROM `files` AS myfiles WHERE myfiles.parent_id = 3"
+        );
+        $stmt->execute([]);
+        $result = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        $rootFiles = [];
+        foreach ($result as $rootFilesArr) {
+            $rootFiles[] = [
+                'file_id' => $rootFilesArr['file_id'],
+                'file_name' => $rootFilesArr['file_name'] . '.' . $rootFilesArr['file_type'],
+                'file_size' => $rootFilesArr['file_size'],
+                'file_status' => $rootFilesArr['file_status']
+            ];
+        }
+        $groupedData['root_files'] = $rootFiles;
+
+        $helper = new CommonHelper();
+        $helper->writeFileIntegrityInfo();
+
+        $response->setStatusCode(Response::HTTP_OK);
+        $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+        $response->setContent(json_encode(['status' => 'CODE:3.001','files' => $groupedData], JSON_UNESCAPED_UNICODE ));
+        $this->logger->getFilesDownload($userName, $ip, $time);
+        return $response;
+    }
+
+    public function getMediaFiles(Request $request, Response $response)
+    {
+        $data = $request->getPayload();
+        $type = $data->get('type');
+        $token = CommonHelper::parseToken($data->get('value'));
+        $ip = $_SERVER['REMOTE_ADDR'];
+        $time = date("Y-m-d H:i:s");
+
+        try {
+            $keyObj = new Key($this->config['key_access']['key'], 'HS256');
+            $decoded = JWT::decode($token, $keyObj);
+        } catch (\Exception $e){
+
+            if($e->getMessage() == "Expired token"){
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['status' => 'CODE:3.000']));
+                return $response;
+            } else {
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['status' => 'CODE:3.000']));
+                return $response;
+            }
+        }
+
+        $newUserResult = $this->userModel->selectLoginUserRolesInfo($token);
+
+        $logUserId = $newUserResult['user_id'];
+        $moduleFilesAccess = $newUserResult['module_files'];
+        $userName  = Symmetric::decrypt($newUserResult["name"], $this->cryptoEncrypter)->getString();
+
+        if ($newUserResult["status"] == 0) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'CODE:3.002']));
+            $this->logger->failOnFilesMediaUserInactive($userName, $ip, $time);
+            return $response;
+        }
+
+        if($moduleFilesAccess != 1) {
+            $response->setStatusCode(Response::HTTP_FORBIDDEN);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'CODE:3.004']));
+            $this->logger->failOnFilesMediaUserForbidden($userName, $ip, $time);
+            return $response;
+        }
+
+        $stmt = $this->connection->prepare(
+            "SELECT myfiles.id as file_id, myfiles.file_type, myfiles.file_name, myfiles.parent_type, myfiles.file_size, myfiles.file_status, category_names.category_id, category_names.name, category_names.url, category_names.description, category_structure.category_id, category_structure.parent_id FROM `category_structure` INNER JOIN category_names ON category_structure.category_id = category_names.category_id LEFT JOIN files as myfiles ON myfiles.parent_id = category_names.category_id WHERE category_structure.parent_id IS NOT NULL AND category_structure.parent_id != 1 AND category_structure.parent_id != 3"
+        );
+        $stmt->execute([]);
+        $result = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        $initialArray = [];
+
+        foreach ($result as $category) {
+            $initialArray[] = [
+                'id' => $category['category_id'],
+                'name' => $category['name'],
+                'parent_id' => $category['parent_id'],
+                'file_name' => $category['file_name'],
+                'childs' => $category['childs']
+            ];
+        }
+
+        $grouped_by_city = $this->group_by_city($result, 'name');
+
+        $keys = array_keys($grouped_by_city);
+
+        $someResult = [];
+
+        for ($i = 0, $j =0; $i < count($keys); $i++) {
+
+            $arr = [];
+            for ($z = 0; $z < count($grouped_by_city[$keys[$i]]); $z++) {
+
+                if ($grouped_by_city[$keys[$i]][$z]['file_id'] == null) {
+                    $arr [] = [];
+                } else {
+                    $arr [] = [
+                        'file_id' => $grouped_by_city[$keys[$i]][$z]['file_id'],
+                        'file_name' => $grouped_by_city[$keys[$i]][$z]['file_name'] .'.'. $grouped_by_city[$keys[$i]][$z]['file_type'],
+                        'file_size' => $grouped_by_city[$keys[$i]][$z]['file_size'],
+                        'file_status' => $grouped_by_city[$keys[$i]][$z]['file_status']
+                    ];
+                }
+            }
+    
+            $someResult [] = [
+                'category_id' => $grouped_by_city[$keys[$i]][0]['category_id'],
+                'parent_id' => $grouped_by_city[$keys[$i]][0]['parent_id'],
+                'url' => str_replace('/', '', $grouped_by_city[$keys[$i]][0]['url']),
+                'name' => str_replace(' ', '_', $grouped_by_city[$keys[$i]][0]['name']),
+                'files' => $arr
+            ];
+        }
+
+        $groupedDataMedia = $this->groupRecursive($someResult, 2);
+
+        $stmt = $this->connection->prepare(
+            "SELECT myfiles.id as file_id, myfiles.file_type, myfiles.file_name, myfiles.parent_type, myfiles.file_size, myfiles.file_status FROM `files` AS myfiles WHERE myfiles.parent_id = 2"
+        );
+        $stmt->execute([]);
+        $result = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+
+        $rootFiles = [];
+        foreach ($result as $rootFilesArr) {
+            $rootFiles[] = [
+                'file_id' => $rootFilesArr['file_id'],
+                'file_name' => $rootFilesArr['file_name'] . '.' . $rootFilesArr['file_type'],
+                'file_size' => $rootFilesArr['file_size'],
+                'file_status' => $rootFilesArr['file_status']
+            ];
+        }
+        $groupedDataMedia['root_files'] = $rootFiles;
+
+        $helper = new CommonHelper();
+        $helper->writeFileIntegrityInfo();
+
+        $response->setStatusCode(Response::HTTP_OK);
+        $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+        $response->setContent(json_encode(['status' => 'CODE:3.001', 'media' => $groupedDataMedia], JSON_UNESCAPED_UNICODE ));
+        $this->logger->getFilesMedia($userName, $ip, $time);
+        return $response;
+    }
+
+    public function find_parents($input, $id, $parents) {
+        //global $parents, $arr;
+        //$parents = [];
+
+        if(is_array($input)) {
+            foreach($input as $k => $val) {
+                if($val['category_id'] == $id  && $val['parent_id'] != 0) {
+                    array_push($parents, $val['parent_id']);
+                    $this->find_parents($input, $val['parent_id'], $parents);
+                }
+            }
+        }
+
+        //return $parents;
+    }
+    public function uploadFiles(Request $request, Response $response)
+    {
+        $data = $request->getPayload();
+        $type = $data->get('type');
+        $token = CommonHelper::parseToken($data->get('value'));
+        $mediaId = $data->get('media-path');
+        $filesId = $data->get('files-path');
+        $ip = $_SERVER['REMOTE_ADDR'];
+        $time = date("Y-m-d H:i:s");
+
+        try {
+            $keyObj = new Key($this->config['key_access']['key'], 'HS256');
+            $decoded = JWT::decode($token, $keyObj);
+        } catch (\Exception $e){
+
+            if($e->getMessage() == "Expired token"){
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['status' => 'CODE:3.000']));
+                return $response;
+            } else {
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['status' => 'CODE:3.000']));
+                return $response;
+            }
+        }
+
+        $testData = [
+            'media_id' => (int)$mediaId,
+            'files_id' => (int)$filesId
+        ];
+
+        $validator = new CMSValidator($testData, [
+            'media_id' => ['numeric'],
+            'files_id' => ['numeric']
+        ]);
+
+        $newUserResult = $this->userModel->selectLoginUserRolesInfo($token);
+
+        $logUserId = $newUserResult['user_id'];
+        $moduleFilesAccess = $newUserResult['module_files'];
+        $userName  = Symmetric::decrypt($newUserResult["name"], $this->cryptoEncrypter)->getString();
+
+
+        if (!$validator->isValid()) {
+            $response->setStatusCode(Response::HTTP_UNPROCESSABLE_ENTITY);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $values = ['status' => 'CODE:3.005', 'errors' => $validator->getErrors()];
+            $response->setContent(json_encode($values));
+            $this->logger->failOnFilesUpload($userName, $ip, $time);
+            return $response;
+        }
+
+        if ($newUserResult["status"] == 0) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'CODE:3.002']));
+            $this->logger->failOnFilesUploadUserInactive($userName, $ip, $time);
+            return $response;
+        }
+
+        if($moduleFilesAccess != 1) {
+            $response->setStatusCode(Response::HTTP_FORBIDDEN);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'CODE:3.004']));
+            $this->logger->failOnFilesUploadUserForbidden($userName, $ip, $time);
+            return $response;
+        }
+
+        $errors = [];
+    
+        $allowedFilesExtensions = [
+            'application/pdf',
+            'application/msword',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/xls', 'application/vnd.ms-excel',
+            'application/vnd.ms-powerpoint',
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            'application/vnd.oasis.opendocument.text',
+            'application/vnd.oasis.opendocument.spreadsheet',
+            'application/vnd.oasis.opendocument.presentation'
+        ];
+        $allowedMediaExtensions = [
+            'image/jpg',
+            'image/jpeg',
+            'image/png',
+            'image/gif',
+            'image/svg+xml',
+            'image/webp',
+            'video/mp4',
+            'video/webm',
+            'video/ogg'
+        ];
+
+
+        if(isset($_FILES['files'])){
+
+            foreach($_FILES['files']['tmp_name'] as $key => $tmp_name ){
+
+                if ($_FILES['files']['error'][$key] === UPLOAD_ERR_OK) {
+                    $file_name = $_FILES['files']['name'][$key];
+                    $file_size = $_FILES['files']['size'][$key];
+                    $file_tmp = $_FILES['files']['tmp_name'][$key];
+                    $file_type = $_FILES['files']['type'][$key];
+                
+                    if ($file_size > 2097152) {
+                        $errors[] = "$file_name exceeds limit of 2 MB";
+                    }
+
+                    if (!in_array($file_type, $allowedFilesExtensions) && !in_array($file_type, $allowedMediaExtensions)) {
+                        $errors[] = "$file_type  extension not allowed";
+                    }
+                } else {
+                    $f_name = $_FILES['files']['name'][$key];
+                    $errors[] = "$f_name  error not uploaded";
+                }
+            }
+      
+        } else {
+            $response->setStatusCode(Response::HTTP_BAD_REQUEST);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'CODE:3.006']));
+            $this->logger->noFilesToBeUploaded($userName, $ip, $time);
+            return $response;
+        }
+
+        if (!empty($errors)) {
+            $response->setStatusCode(Response::HTTP_BAD_REQUEST);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'CODE:3.006', 'errors' => $errors]));
+            $this->logger->errorsWhenUploadingFIles($userName, $ip, $time);
+
+            return $response;
+        }
+
+        $filePathFirst = null;
+        $filePathSecond = null;
+
+        $stmt = $this->connection->prepare(
+            "SELECT category_structure.category_id, category_structure.parent_id, category_names.url FROM category_names INNER JOIN category_structure ON category_names.category_id = category_structure.category_id"
+        );
+        $stmt->execute([]);
+        $result = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+
+        $filePathFirst = '/downloads';
+
+        if ($filesId != 'root') {
+            $resulty = $this->getParentsRecursive($result, $filesId);
+            if (!empty($resulty)) {
+                array_walk_recursive($resulty, function ($v, $k) use (&$resultA, &$parentIds) {
+                    if ($k == 'url') $resultA[] = $v;
+                    if ($k == 'parent_id') $parentIds[] = $v;
+
+                });
+
+                $resultA = array_reverse($resultA);
+                for ($i = 0; $i < count($resultA); $i++) {
+                    $filePathFirst .= $resultA[$i];
+                }
+            }
+        }
+
+        $filePathSecond = '/media';
+        if ($mediaId != 'root') {
+            $resultySecond = $this->getParentsRecursive($result, $mediaId);
+            if (!empty($resultySecond)) {
+
+                array_walk_recursive($resultySecond, function ($v, $k) use (&$resultB, &$parentIdse) {
+                    if ($k == 'url') $resultB[] = $v;
+                    if ($k == 'parent_id') $parentIdse[] = $v;
+
+                });
+
+                $resultB = array_reverse($resultB);
+                for ($j = 0; $j < count($resultB); $j++) {
+                    $filePathSecond .= $resultB[$j];
+                }
+            }
+        }
+
+        $filesPathArray = [];
+        $mediaPathArray = [];
+
+
+        foreach($_FILES['files']['tmp_name'] as $key => $tmp_name ){
+
+                $file_name = $_FILES['files']['name'][$key];
+                $file_size = $_FILES['files']['size'][$key];
+                $file_tmp = $_FILES['files']['tmp_name'][$key];
+                $file_type = $_FILES['files']['type'][$key];
+                if (in_array($file_type, $allowedFilesExtensions)) {
+                    $filesPathArray[] = $filePathFirst . '/' . $_FILES['files']['name'][$key];
+                }
+                if (in_array($file_type, $allowedMediaExtensions)) {
+                    $mediaPathArray[] = $filePathSecond . '/' . $_FILES['files']['name'][$key];
+                }
+            }
+
+        $dirFiles = __DIR__ .  '/../..' .$filePathFirst;
+        $dirMedia = __DIR__ .  '/../..' .$filePathSecond;
+    
+        if(is_dir($dirFiles) == false) {
+            mkdir($dirFiles, 0777, true);
+        }
+
+        if(is_dir($dirMedia) == false) {
+            mkdir($dirMedia, 0777, true);
+        }
+
+        $returnedFiles = [];
+        $files = false;
+        $media = false;
+        foreach($_FILES['files']['tmp_name'] as $key => $tmp_name ){
+            $transliteratedName = null;
+            $transliteratedNameWithExt = null;
+            $file_name = $_FILES['files']['name'][$key];
+            $file_size = $_FILES['files']['size'][$key];
+            $file_tmp = $_FILES['files']['tmp_name'][$key];
+            $file_type = $_FILES['files']['type'][$key];
+            $file_name_without_ext = strtok($file_name, '.');
+            if (preg_match('/[А-яЁё]/u', $file_name_without_ext)) {
+                $nameWithoutSpaces = str_replace(' ', '-', $file_name_without_ext);
+                $transliteratedName = $this->transliterate($nameWithoutSpaces);
+                $relatedExt = substr($file_name, strpos($file_name, ".") + 1);
+                $transliteratedNameWithExt = $transliteratedName . $relatedExt;
+            }
+
+
+
+            if (in_array($file_type, $allowedFilesExtensions)) {
+                $fileNameReady = $transliteratedName != null ? $transliteratedNameWithExt : $file_name;
+            
+                move_uploaded_file($file_tmp,"$dirFiles/".$fileNameReady);
+                $returnedFiles [] = [
+                    'file_name' => $transliteratedName != null ? $transliteratedName : strtok($file_name, '.'),
+                    'file_type' => substr($file_name, strpos($file_name, ".") + 1),
+                    'file_size' => $file_size,
+                    'parent_type' => 'downloads',
+                    'parent_id' => $filesId == 'root' ? 3 : $filesId
+                ];
+                $files = true;
+            }
+            if (in_array($file_type, $allowedMediaExtensions)) {
+                $fileNameReady = $transliteratedName != null ? $transliteratedNameWithExt : $file_name;
+                move_uploaded_file($file_tmp, "$dirMedia/" . $fileNameReady);
+                $returnedFiles [] = [
+                    'file_name' => $transliteratedName != null ? $transliteratedName : strtok($file_name, '.'),
+                    'file_type' => substr($file_name, strpos($file_name, ".") + 1),
+                    'file_size' => $file_size,
+                    'parent_type' => 'gallery',
+                    'parent_id' => $mediaId == 'root' ? 2 : $mediaId
+                ];
+                $media = true;
+            }
+
+        }
+
+        foreach($returnedFiles as $fileInDb){
+
+            $parentId = $fileInDb['parent_id'];
+            $parentType = $fileInDb['parent_type'];
+            $fileType = $fileInDb['file_type'];
+            $fileName = $fileInDb['file_name'];
+            $fileSize = $fileInDb['file_size'];
+            $fileStatus = 0;
+
+            $stmt = $this->connection->prepare(
+                "INSERT INTO files (parent_id, parent_type, file_type, file_name, file_size, file_status) 
+                        VALUES (:parent_id, :parent_type, :file_type, :file_name, :file_size, :file_status)"
+            );
+            $stmt->bindParam(':parent_id', $parentId);
+            $stmt->bindParam(':parent_type', $parentType);
+            $stmt->bindParam(':file_type', $fileType);
+            $stmt->bindParam(':file_name', $fileName);
+            $stmt->bindParam(':file_size', $fileSize);
+            $stmt->bindParam(':file_status', $fileStatus);
+            $stmt->execute();
+        }
+
+        $this->logger->uploadedFiles($userName, $ip, $time);
+
+        $helper = new CommonHelper();
+        $helper->writeFileIntegrityInfo();
+
+        $response->setStatusCode(Response::HTTP_OK);
+        $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+        $response->setContent(json_encode(['status' => 'CODE:3.001','files' => $files, 'media' => $media]));
+        return $response;
+
+    }
+
+
+    public function transliterate($text) {
+        $translitMap = [
+            'А'=>'A','Б'=>'B','В'=>'V','Г'=>'G','Д'=>'D','Е'=>'E','Ё'=>'Yo','Ж'=>'Zh','З'=>'Z','И'=>'I',
+            'Й'=>'Y','К'=>'K','Л'=>'L','М'=>'M','Н'=>'N','О'=>'O','П'=>'P','Р'=>'R','С'=>'S','Т'=>'T',
+            'У'=>'U','Ф'=>'F','Х'=>'Kh','Ц'=>'Ts','Ч'=>'Ch','Ш'=>'Sh','Щ'=>'Shch','Ъ'=>'','Ы'=>'Y','Ь'=>'',
+            'Э'=>'E','Ю'=>'Yu','Я'=>'Ya',
+            'а'=>'a','б'=>'b','в'=>'v','г'=>'g','д'=>'d','е'=>'e','ё'=>'yo','ж'=>'zh','з'=>'z','и'=>'i',
+            'й'=>'y','к'=>'k','л'=>'l','м'=>'m','н'=>'n','о'=>'o','п'=>'p','р'=>'r','с'=>'s','т'=>'t',
+            'у'=>'u','ф'=>'f','х'=>'kh','ц'=>'ts','ч'=>'ch','ш'=>'sh','щ'=>'shch','ъ'=>'','ы'=>'y','ь'=>'',
+            'э'=>'e','ю'=>'yu','я'=>'ya'
+        ];
+        return strtr($text, $translitMap);
+    }
+
+    public function deleteFiles(Request $request, Response $response)
+    {
+        $data = $request->getPayload();
+        $type = $data->get('type');
+        $token = CommonHelper::parseToken($data->get('value'));
+        $fileId = $data->get('file_id');
+        $ip = $_SERVER['REMOTE_ADDR'];
+        $time = date("Y-m-d H:i:s");
+
+
+        try {
+            $keyObj = new Key($this->config['key_access']['key'], 'HS256');
+            $decoded = JWT::decode($token, $keyObj);
+        } catch (\Exception $e){
+
+            if($e->getMessage() == "Expired token"){
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['status' => 'CODE:3.000']));
+                return $response;
+            } else {
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['status' => 'CODE:3.000']));
+                return $response;
+            }
+        }
+
+        $testData = [
+            'file_id' => $fileId,
+        ];
+
+        $validator = new CMSValidator($testData, [
+            'file_id' => ['required', 'numeric']
+        ]);
+
+        $newUserResult = $this->userModel->selectLoginUserRolesInfo($token);
+
+        $logUserId = $newUserResult['user_id'];
+        $moduleFilesAccess = $newUserResult['module_files'];
+        $userName  = Symmetric::decrypt($newUserResult["name"], $this->cryptoEncrypter)->getString();
+
+        if (!$validator->isValid()) {
+            $response->setStatusCode(Response::HTTP_UNPROCESSABLE_ENTITY);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $values = ['status' => 'CODE:3.005', 'errors' => $validator->getErrors()];
+            $response->setContent(json_encode($values));
+            $this->logger->failOnDeleteFiles($userName, $ip, $time);
+            return $response;
+        }
+
+        if ($newUserResult["status"] == 0) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            //$response->setContent(json_encode(['status' => 'CODE:3.002', 'message' => 'user is inactive']));
+            $response->setContent(json_encode(['status' => 'CODE:3.002']));
+            $this->logger->failOnDeleteFilesUserInactive($userName, $ip, $time);
+            return $response;
+        }
+
+        if($moduleFilesAccess != 1) {
+            $response->setStatusCode(Response::HTTP_FORBIDDEN );
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+           // $response->setContent(json_encode(['status' => 'CODE:3.002', 'message' => 'not permitted by role']));
+            $response->setContent(json_encode(['status' => 'CODE:3.004']));
+            $this->logger->failOnDeleteFilesUserForbidden($userName, $ip, $time);
+            return $response;
+        }
+
+        $stmt = $this->connection->prepare("SELECT parent_id, file_name, file_type, parent_type FROM files WHERE id = :file_id");
+        $stmt->execute(['file_id' => $fileId]);
+
+        $result = $stmt->fetch(\PDO::FETCH_ASSOC);
+
+        $stmt = $this->connection->prepare("SELECT category_structure.category_id, category_structure.parent_id, category_names.url FROM category_names INNER JOIN category_structure ON category_names.category_id = category_structure.category_id");
+        $stmt->execute([]);
+
+        $resultTest = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        $fileToBeDeleted =  null;
+        $filePathBeginFiles = null;
+        $filePathBeginMedia = null;
+           //for ($z = 0; $z < count($result); $z++) {
+            $filePathBegin = '';
+                $resulty = $this->getParentsRecursive($resultTest, $result['parent_id']);
+
+                  if ($result['parent_type'] == 'downloads') {
+                     $filePathBegin = "/downloads";
+                     if (!empty($resulty)) {
+                         array_walk_recursive($resulty, function ($v, $k) use (&$resultA, &$parentIds) {
+                            if ($k == 'url') $resultA[] = $v;
+                              if ($k == 'parent_id') $parentIds[] = $v;
+
+                          });
+
+                          $resultA = array_reverse($resultA);
+                         for ($i = 0; $i < count($resultA); $i++) {
+                             $filePathBegin .= $resultA[$i];
+                        }
+        $fileToBeDeleted = $filePathBegin . '/'.$result['file_name'] . '.' . $result['file_type'];
+
+                     }
+                     //$filesToBeDeleted[] = $filePathBeginFiles;
+
+                 } else {
+
+        //if($result[$z]['parent_type'] == 'media'){
+                     $filePathBegin = "/media";
+                    if (!empty($resulty)) {
+                        array_walk_recursive($resulty, function ($v, $k) use (&$resultB, &$parentIds) {
+                            if ($k == 'url') $resultB[] = $v;
+                            if ($k == 'parent_id') $parentIds[] = $v;
+
+                        });
+
+                         $resultB = array_reverse($resultB);
+                         for ($i = 0; $i < count($resultB); $i++) {
+                            $filePathBeginMedia .= $resultB[$i];
+                         }
+                        $fileToBeDeleted = $filePathBegin . '/'.$result['file_name'] . '.' . $result['file_type'];
+
+                       }
+                      // $filesToBeDeleted[] = $filePathBeginMedia;
+
+                  }
+
+        $fullPathToDelete = __DIR__ . '/../..' .$fileToBeDeleted;
+        if (file_exists($fullPathToDelete)) {
+            unlink($fullPathToDelete);
+        }
+
+        //$sql = "DELETE FROM files WHERE id = $fileId";
+        //$this->connection->query($sql)->execute();
+
+        $sql = "DELETE FROM files WHERE id = :file_id";
+        $stmt = $this->connection->prepare($sql);
+        $stmt->bindParam(':file_id', $fileId); // Bind the parameter with wildcards (s for string)
+        $stmt->execute();
+
+
+        $this->logger->deletedFiles($userName, $ip, $time);
+
+        $helper = new CommonHelper();
+        $helper->writeFileIntegrityInfo();
+
+        $response->setStatusCode(Response::HTTP_OK);
+        $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+        //$response->setContent(json_encode(['status' => 'CODE:3.001','message' => 'file was deleted']));
+        $response->setContent(json_encode(['status' => 'CODE:3.001']));
+        return $response;
+    }
+
+    public function publishFile(Request $request, Response $response)
+    {
+        $data = $request->getPayload();
+        $type = $data->get('type');
+        $token = CommonHelper::parseToken($data->get('value'));
+        $ip = $_SERVER['REMOTE_ADDR'];
+        $time = date("Y-m-d H:i:s");
+
+        try {
+            $keyObj = new Key($this->config['key_access']['key'], 'HS256');
+            $decoded = JWT::decode($token, $keyObj);
+        } catch (\Exception $e){
+
+            if($e->getMessage() == "Expired token"){
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['error' => 'token expired']));
+                return $response;
+            } else {
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['error' => 'token not valid']));
+                return $response;
+            }
+        }
+
+        $newUserResult = $this->userModel->selectLoginUserRolesInfo($token);
+
+        $logUserId = $newUserResult['user_id'];
+        $moduleFilesAccess = $newUserResult['module_files'];
+
+        if ($newUserResult["status"] == 0) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'user is inactive']));
+            return $response;
+        }
+
+        if($moduleFilesAccess != 1) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'not permitted by role']));
+            return $response;
+        }
+
+        /*To continue*/
+
+
+        $this->logger->publishedFile($logUserId, $ip, $time);
+
+        $response->setStatusCode(Response::HTTP_OK);
+        $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+        $response->setContent(json_encode([]));
+        return $response;
+    }
+
+    public function renameFile(Request $request, Response $response)
+    {
+        $data = $request->getPayload();
+        $type = $data->get('type');
+        $token = CommonHelper::parseToken($data->get('value'));
+        $fileId = $data->get('file_id');
+        $fileName = $data->get('file_name');
+        $ip = $_SERVER['REMOTE_ADDR'];
+        $time = date("Y-m-d H:i:s");
+
+        try {
+            $keyObj = new Key($this->config['key_access']['key'], 'HS256');
+            $decoded = JWT::decode($token, $keyObj);
+        } catch (\Exception $e){
+
+            if($e->getMessage() == "Expired token"){
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                //$response->setContent(json_encode(['status' => 'CODE:3.000', 'error' => 'token expired']));
+                $response->setContent(json_encode(['status' => 'CODE:3.000']));
+                return $response;
+            } else {
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                //$response->setContent(json_encode(['status' => 'CODE:3.000', 'error' => 'token not valid']));
+                $response->setContent(json_encode(['status' => 'CODE:3.000']));
+                return $response;
+            }
+        }
+
+        $testData = [
+            'file_id' => (int)$fileId,
+            'file_name' => $fileName
+        ];
+
+        $validator = new CMSValidator($testData, [
+            'file_id' => ['required', 'numeric'],
+            'file_name' => ['required', 'string']
+        ]);
+
+
+        $newUserResult = $this->userModel->selectLoginUserRolesInfo($token);
+
+        $logUserId = $newUserResult['user_id'];
+        $moduleFilesAccess = $newUserResult['module_files'];
+        $userName  = Symmetric::decrypt($newUserResult["name"], $this->cryptoEncrypter)->getString();
+
+        if (!$validator->isValid()) {
+            $response->setStatusCode(Response::HTTP_UNPROCESSABLE_ENTITY);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $values = ['status' => 'CODE:3.005', 'errors' => $validator->getErrors()];
+            $response->setContent(json_encode($values));
+            $this->logger->failOnRenameFiles($userName, $ip, $time);
+            return $response;
+        }
+
+        if ($newUserResult["status"] == 0) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'CODE:3.002']));
+            $this->logger->failOnRenameFilesUserInactive($userName, $ip, $time);
+            return $response;
+        }
+
+        if($moduleFilesAccess != 1) {
+            $response->setStatusCode(Response::HTTP_FORBIDDEN);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'CODE:3.004']));
+            $this->logger->failOnRenameFilesUserForbidden($userName, $ip, $time);
+            return $response;
+        }
+
+        $filePathToRename = null;
+
+        $stmt = $this->connection->prepare(
+            "SELECT parent_id, file_type, file_name, parent_type FROM files WHERE id = :file_id"
+        );
+
+        $stmt->execute(['file_id' => $fileId]);
+
+        $result = $stmt->fetch(\PDO::FETCH_ASSOC);
+
+        $parentType = $result['parent_type'];
+        $oldFileName = $result['file_name'];
+        $fileType = $result['file_type'];
+        $oldFileNameType = $oldFileName . '.' . $fileType;
+        $parentIdFile = $result['parent_id'];
+        if ($parentType = 'downloads') {
+            $filePathToRename = '/downloads';
+        } else {
+            $filePathToRename = '/media';
+        }
+
+        $stmt = $this->connection->prepare(
+            "SELECT category_structure.category_id, category_structure.parent_id, category_names.url FROM category_names INNER JOIN category_structure ON category_names.category_id = category_structure.category_id"
+        );
+
+        $stmt->execute([]);
+
+        $result = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        $resulty = $this->getParentsRecursive($result, $parentIdFile);
+        if (!empty($resulty)) {
+            array_walk_recursive($resulty, function ($v, $k) use (&$resultA, &$parentIds) {
+                if ($k == 'url') $resultA[] = $v;
+                if ($k == 'parent_id') $parentIds[] = $v;
+
+            });
+
+            $resultA = array_reverse($resultA);
+            for ($i = 0; $i < count($resultA); $i++) {
+                $filePathToRename .= $resultA[$i];
+            }
+        }
+
+        $newName = strtok($fileName, '.');
+        $oldType = substr($oldFileNameType, strpos($oldFileNameType, ".") + 1);
+        $newFileNameWithType = $newName . '.' .$oldType;
+        $dirOldName = __DIR__ .  '/../..' .$filePathToRename . '/' . $oldFileNameType;
+        $dirNewName = __DIR__ .  '/../..' .$filePathToRename . '/' . $newFileNameWithType;
+        rename($dirOldName, $dirNewName);
+
+        $stmt = $this->connection->prepare(
+            "UPDATE `files` SET `file_name` = :file_name WHERE `id`= :file_id"
+        );
+        $stmt->bindValue(':file_name', $newName);
+        $stmt->bindValue(':file_id', $fileId);
+        $stmt->execute();
+
+
+        $this->logger->renamedFile($userName, $ip, $time);
+
+        $helper = new CommonHelper();
+        $helper->writeFileIntegrityInfo();
+
+        $response->setStatusCode(Response::HTTP_OK);
+        $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+        $response->setContent(json_encode(['status' => 'CODE:3.001']));
+        return $response;
+    }
+
+    public function robots(Request $request, Response $response)
+    {
+        $data = $request->getPayload();
+        $type = $data->get('type');
+        $token = CommonHelper::parseToken($data->get('value'));
+        $ip = $_SERVER['REMOTE_ADDR'];
+        $time = date("Y-m-d H:i:s");
+
+        try {
+            $keyObj = new Key($this->config['key_access']['key'], 'HS256');
+            $decoded = JWT::decode($token, $keyObj);
+        } catch (\Exception $e){
+
+            if($e->getMessage() == "Expired token"){
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['error' => 'token expired']));
+                return $response;
+            } else {
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['error' => 'token not valid']));
+                return $response;
+            }
+        }
+
+        $newUserResult = $this->userModel->selectLoginUserRolesInfo($token);
+
+        $logUserId = $newUserResult['user_id'];
+        $moduleFilesAccess = $newUserResult['module_files'];
+
+        if ($newUserResult["status"] == 0) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'user is inactive']));
+            return $response;
+        }
+
+        if($moduleFilesAccess != 1) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'not permitted by role']));
+            return $response;
+        }
+
+        /*To continue*/
+
+        $this->logger->robots($logUserId, $ip, $time);
+
+        $response->setStatusCode(Response::HTTP_OK);
+        $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+        $response->setContent(json_encode([]));
+        return $response;
+    }
+
+    public function siteMap(Request $request, Response $response)
+    {
+        $data = $request->getPayload();
+        $type = $data->get('type');
+        $token = CommonHelper::parseToken($data->get('value'));
+        $ip = $_SERVER['REMOTE_ADDR'];
+        $time = date("Y-m-d H:i:s");
+
+
+        try {
+            $keyObj = new Key($this->config['key_access']['key'], 'HS256');
+            $decoded = JWT::decode($token, $keyObj);
+        } catch (\Exception $e){
+
+            if($e->getMessage() == "Expired token"){
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['error' => 'token expired']));
+                return $response;
+            } else {
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['error' => 'token not valid']));
+                return $response;
+            }
+        }
+
+        $newUserResult = $this->userModel->selectLoginUserRolesInfo($token);
+
+        $logUserId = $newUserResult['user_id'];
+        $moduleFilesAccess = $newUserResult['module_files'];
+
+        if ($newUserResult["status"] == 0) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'user is inactive']));
+            return $response;
+        }
+
+        if($moduleFilesAccess != 1) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'not permitted by role']));
+            return $response;
+        }
+
+        /*To continue*/
+
+        $this->logger->sitemap($logUserId, $ip, $time);
+
+        $response->setStatusCode(Response::HTTP_OK);
+        $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+        $response->setContent(json_encode([]));
+        return $response;
+    }
+
+    public function renewCache(Request $request, Response $response)
+    {
+        $data = $request->getPayload();
+        $type = $data->get('type');
+        $token = CommonHelper::parseToken($data->get('value'));
+        $ip = $_SERVER['REMOTE_ADDR'];
+        $time = date("Y-m-d H:i:s");
+
+        try {
+            $keyObj = new Key($this->config['key_access']['key'], 'HS256');
+            $decoded = JWT::decode($token, $keyObj);
+        } catch (\Exception $e){
+
+            if($e->getMessage() == "Expired token"){
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['error' => 'token expired']));
+                return $response;
+            } else {
+                $response->setStatusCode(Response::HTTP_PARTIAL_CONTENT);
+                $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+                $response->setContent(json_encode(['error' => 'token not valid']));
+                return $response;
+            }
+        }
+
+        $newUserResult = $this->userModel->selectLoginUserRolesInfo($token);
+
+        $logUserId = $newUserResult['user_id'];
+        $moduleFilesAccess = $newUserResult['module_files'];
+
+        if ($newUserResult["status"] == 0) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'user is inactive']));
+            return $response;
+        }
+
+        if($moduleFilesAccess != 1) {
+            $response->setStatusCode(Response::HTTP_UNAUTHORIZED);
+            $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+            $response->setContent(json_encode(['status' => 'not permitted by role']));
+            return $response;
+        }
+
+        /*To continue*/
+
+        $this->logger->renewCache($logUserId, $ip, $time);
+
+        $response->setStatusCode(Response::HTTP_OK);
+        $response->headers->set(self::CONTENT_TYPE, self::CONTENT_TYPE_VALUE);
+        $response->setContent(json_encode([]));
+        return $response;
+    }
+}
